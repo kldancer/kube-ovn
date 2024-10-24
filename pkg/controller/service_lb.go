@@ -23,6 +23,7 @@ const (
 	initRouteTable = "init"
 	podEIPAdd      = "eip-add"
 	podDNATAdd     = "dnat-add"
+	podDNATDel     = "dnat-del"
 	attachmentName = "lb-svc-attachment"
 	attachmentNs   = "kube-system"
 )
@@ -327,7 +328,11 @@ func (c *Controller) updatePodAttachNets(pod *corev1.Pod, svc *corev1.Service) e
 		}
 
 		var rules []string
-		rules = append(rules, fmt.Sprintf("%s,%d,%s,%s,%d,%s", loadBalancerIP, port.Port, protocol, svc.Spec.ClusterIP, port.Port, defaultGateway))
+		targetPort := port.TargetPort.IntValue()
+		if targetPort == 0 {
+			targetPort = int(port.Port)
+		}
+		rules = append(rules, fmt.Sprintf("%s,%d,%s,%s,%d,%s", loadBalancerIP, port.Port, protocol, svc.Spec.ClusterIP, targetPort, defaultGateway))
 		klog.Infof("add dnat rules for lb svc pod, %v", rules)
 		if err := c.execNatRules(pod, podDNATAdd, rules); err != nil {
 			klog.Errorf("failed to add dnat for pod, err: %v", err)
@@ -335,5 +340,109 @@ func (c *Controller) updatePodAttachNets(pod *corev1.Pod, svc *corev1.Service) e
 		}
 	}
 
+	return nil
+}
+
+func (c *Controller) checkAndReInitLbSvcPod(pod *corev1.Pod) error {
+	if pod.Status.Phase != corev1.PodRunning {
+		klog.V(3).Infof("pod %s/%s is not running", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	var exist bool
+	var nsName, svcName string
+
+	// ensure that pod is created by load-balancer service
+	if nsName, exist = pod.Labels["namespace"]; !exist {
+		return nil
+	}
+	if svcName, exist = pod.Labels["service"]; !exist {
+		return nil
+	}
+	if deployName, exist := pod.Labels["app"]; !exist || !strings.HasPrefix(deployName, "lb-svc-") {
+		return nil
+	}
+
+	c.svcKeyMutex.LockKey(svcName)
+	defer func() { _ = c.svcKeyMutex.UnlockKey(svcName) }()
+
+	lbsvc, err := c.servicesLister.Services(nsName).Get(svcName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Error(err)
+		return err
+	}
+	if lbsvc.Spec.Type != corev1.ServiceTypeLoadBalancer || !c.config.EnableLbSvc {
+		return nil
+	}
+
+	if pod.Status.Phase == corev1.PodRunning && len(lbsvc.Status.LoadBalancer.Ingress) == 1 {
+		klog.Infof("LB service pod Running %s/%s for service %s", nsName, pod.Name, svcName)
+		if err = c.updatePodAttachNets(pod, lbsvc); err != nil {
+			klog.Errorf("failed to update service %s/%s attachment network: %v", nsName, svcName, err)
+			return err
+		}
+
+		loadBalancerIP, err := c.getPodAttachIP(pod, lbsvc)
+		if err != nil {
+			klog.Errorf("failed to get loadBalancer IP for %s/%s: %v", nsName, svcName, err)
+			return err
+		}
+		lbsvc = lbsvc.DeepCopy()
+		lbsvc.Status.LoadBalancer.Ingress[0].IP = loadBalancerIP
+
+		if _, err = c.config.KubeClient.CoreV1().Services(nsName).UpdateStatus(context.Background(), lbsvc, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("failed to update service %s/%s status: %v", nsName, svcName, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) checkLbSvcDeployAnnotationChanged(svc *corev1.Service) (bool, error) {
+	deployName := genLbSvcDpName(svc.Name)
+	deploy, err := c.config.KubeClient.AppsV1().Deployments(svc.Namespace).Get(context.Background(), deployName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	if newDeploy := c.updateLbSvcDeployment(svc, deploy); newDeploy == nil {
+		klog.V(3).Infof("no need to update deployment %s/%s", deploy.Namespace, deploy.Name)
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *Controller) delDnatRules(pod *corev1.Pod, toDel []corev1.ServicePort, svc *corev1.Service) error {
+	providerName := getAttachNetworkProvider(svc)
+	attachIPAnnotation := fmt.Sprintf(util.IPAddressAnnotationTemplate, providerName)
+	loadBalancerIP := pod.Annotations[attachIPAnnotation]
+
+	for _, port := range toDel {
+		var protocol string
+		switch port.Protocol {
+		case corev1.ProtocolTCP:
+			protocol = util.ProtocolTCP
+		case corev1.ProtocolUDP:
+			protocol = util.ProtocolUDP
+		case corev1.ProtocolSCTP:
+			protocol = util.ProtocolSCTP
+		}
+
+		var rules []string
+		targetPort := port.TargetPort.IntValue()
+		if targetPort == 0 {
+			targetPort = int(port.Port)
+		}
+		rules = append(rules, fmt.Sprintf("%s,%d,%s,%s,%d", loadBalancerIP, port.Port, protocol, svc.Spec.ClusterIP, targetPort))
+		klog.Infof("delete dnat rules for lb svc pod, %v", rules)
+		if err := c.execNatRules(pod, podDNATDel, rules); err != nil {
+			klog.Errorf("failed to del dnat rules for pod, err: %v", err)
+			return err
+		}
+	}
 	return nil
 }
